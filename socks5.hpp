@@ -1,3 +1,4 @@
+#include <atomic>
 #include <boost/asio.hpp>
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/io_context.hpp>
@@ -9,7 +10,6 @@
 #include <cstdint>
 #include <memory>
 #include <string_view>
-#include <vector>
 
 namespace SOCKS5 {
 class StreamBuffer : public boost::noncopyable {
@@ -93,14 +93,17 @@ private:
 
   boost::asio::ip::tcp::resolver m_resolver;
   boost::asio::ip::tcp::endpoint m_endpoint;
+  boost::asio::ip::tcp::socket m_destinationSocket;
 };
 
 class ProxySessionTcp : public ProxySessionBase,
                         public std::enable_shared_from_this<ProxySessionTcp> {
 public:
-  explicit ProxySessionTcp(ProxySessionBase &base,
+  explicit ProxySessionTcp(std::uint32_t session_id,
+                           boost::asio::ip::tcp::socket &&client_socket,
+                           boost::asio::ip::tcp::socket &&destination_socket,
                            std::size_t buffer_size = 65535);
-  void start(boost::asio::ip::tcp::endpoint &destination);
+  void start();
 
 private:
   void recv_from_both();
@@ -127,7 +130,7 @@ public:
 private:
   void async_accept();
 
-  uint32_t m_nextSessionId;
+  std::atomic<uint32_t> m_nextSessionId;
   boost::asio::ip::tcp::acceptor m_acceptor;
 };
 }; // namespace SOCKS5

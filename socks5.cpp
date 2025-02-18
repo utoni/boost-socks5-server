@@ -37,7 +37,8 @@ ProxySessionBase::ProxySessionBase(std::uint32_t session_id,
 ProxySessionAuth::ProxySessionAuth(std::uint32_t session_id,
                                    tcp::socket &&client_socket)
     : ProxySessionBase(session_id, std::move(client_socket), 32),
-      m_resolver{m_clientSocket.get_executor()} {}
+      m_resolver{m_clientSocket.get_executor()},
+      m_destinationSocket{m_clientSocket.get_executor()} {}
 
 void ProxySessionAuth::start() {
   boost::asio::async_read(
@@ -55,9 +56,10 @@ void ProxySessionAuth::recv_client_greeting(const boost::system::error_code &ec,
 
   if (m_inBuf[0] != 0x05 || m_inBuf[1] > 0x09 || m_inBuf[1] == 0x00)
     return;
-  if (m_inBuf.size() < std::size_t(2) + m_inBuf[1]) {
+  const std::size_t expected_size = std::size_t(2) + m_inBuf[1];
+  if (m_inBuf.size() < expected_size) {
     boost::asio::async_read(
-        m_clientSocket, +m_inBuf, boost::asio::transfer_exactly(m_inBuf[1]),
+        m_clientSocket, +m_inBuf, boost::asio::transfer_exactly(expected_size - m_inBuf.size()),
         boost::bind(&ProxySessionAuth::recv_client_greeting, shared_from_this(),
                     boost::asio::placeholders::error,
                     boost::asio::placeholders::bytes_transferred));
@@ -65,14 +67,14 @@ void ProxySessionAuth::recv_client_greeting(const boost::system::error_code &ec,
   }
 
   auto found_no_auth = false; // only No Authentication supported
-  for (auto i = std::size_t(2); i < std::size_t(2) + m_inBuf[1]; ++i) {
+  for (auto i = std::size_t(2); i < expected_size; ++i) {
     if (m_inBuf[i] == 0x00) {
       found_no_auth = true;
       break;
     }
   }
 
-  m_inBuf -= std::size_t(2) + m_inBuf[1];
+  m_inBuf -= expected_size;
   send_server_greeting(found_no_auth);
 }
 
@@ -106,9 +108,9 @@ void ProxySessionAuth::recv_connection_request(
 }
 
 void ProxySessionAuth::process_connection_request() {
-  if (m_inBuf.size() < 7) {
+  if (m_inBuf.size() < 6) {
     boost::asio::async_read(
-        m_clientSocket, +m_inBuf, boost::asio::transfer_exactly(7),
+        m_clientSocket, +m_inBuf, boost::asio::transfer_exactly(6 - m_inBuf.size()),
         boost::bind(&ProxySessionAuth::recv_connection_request,
                     shared_from_this(), boost::asio::placeholders::error,
                     boost::asio::placeholders::bytes_transferred));
@@ -156,7 +158,7 @@ void ProxySessionAuth::process_connection_request() {
     m_endpoint = tcp::endpoint(boost::asio::ip::make_address_v4(ip4_bytes),
                                ::ntohs(*reinterpret_cast<const uint16_t *>(
                                    m_inBuf(4 + address_size))));
-    send_server_response(proxy_cmd, 0x00);
+    connect_to_destination(proxy_cmd);
     return;
   }
   case 0x03: {
@@ -173,7 +175,7 @@ void ProxySessionAuth::process_connection_request() {
     m_endpoint = tcp::endpoint(boost::asio::ip::make_address_v6(ip6_array),
                                ::ntohs(*reinterpret_cast<const uint16_t *>(
                                    m_inBuf(4 + address_size))));
-    send_server_response(proxy_cmd, 0x00);
+    connect_to_destination(proxy_cmd);
     return;
   }
   default:
@@ -221,7 +223,7 @@ void ProxySessionAuth::resolve_destination_host(std::uint8_t proxy_cmd,
                              /* TODO: Support iterating and connecting to
                               * multiple resolved hosts on failure. */
                              m_endpoint = *it;
-                             send_server_response(proxy_cmd, 0x00);
+                             connect_to_destination(proxy_cmd);
                            });
 }
 
@@ -229,19 +231,29 @@ void ProxySessionAuth::connect_to_destination(std::uint8_t proxy_cmd) {
   switch (proxy_cmd) {
   case 0x01: // TCP client connection
   {
-    auto tcp_session = std::make_shared<ProxySessionTcp>(*this);
-    tcp_session->start(m_endpoint);
-    break;
+    m_destinationSocket.async_connect(
+        m_endpoint,
+        [this, self = shared_from_this(), proxy_cmd](const boost::system::error_code &ec) {
+          if (ec) {
+            send_server_response(proxy_cmd, 0x04);
+            return;
+          }
+          send_server_response(proxy_cmd, 0x00);
+        });
+    return;
   }
   case 0x02: // TCP port bind
   {
+    send_server_response(proxy_cmd, 0x02);
     return;
   }
   case 0x03: // UDP port bind
   {
+    send_server_response(proxy_cmd, 0x02);
     return;
   }
   default:
+    send_server_response(proxy_cmd, 0x01);
     return;
   }
 }
@@ -277,25 +289,35 @@ void ProxySessionAuth::handle_response_write(
   }
 
   if (status_code == 0x00)
-    connect_to_destination(proxy_cmd);
+    switch (proxy_cmd) {
+    case 0x01: // TCP client connection
+    {
+      auto tcp_session = std::make_shared<ProxySessionTcp>(
+          m_sessionId, std::move(m_clientSocket),
+          std::move(m_destinationSocket));
+      tcp_session->start();
+      break;
+    }
+    case 0x02: // TCP port bind
+    {
+      return;
+    }
+    case 0x03: // UDP port bind
+    {
+      return;
+    }
+    default:
+      return;
+    }
 }
 
-ProxySessionTcp::ProxySessionTcp(ProxySessionBase &base,
-                                 std::size_t buffer_size)
-    : ProxySessionBase(base.m_sessionId, std::move(base.m_clientSocket),
-                       buffer_size),
-      m_destinationSocket(m_clientSocket.get_executor()) {}
+ProxySessionTcp::ProxySessionTcp(
+    std::uint32_t session_id, boost::asio::ip::tcp::socket &&client_socket,
+    boost::asio::ip::tcp::socket &&destination_socket, std::size_t buffer_size)
+    : ProxySessionBase(session_id, std::move(client_socket), buffer_size),
+      m_destinationSocket(std::move(destination_socket)) {}
 
-void ProxySessionTcp::start(tcp::endpoint &destination) {
-  m_destinationSocket.async_connect(
-      destination,
-      [this, self = shared_from_this()](const boost::system::error_code &ec) {
-        if (ec) {
-          return;
-        }
-        recv_from_both();
-      });
-}
+void ProxySessionTcp::start() { recv_from_both(); }
 
 void ProxySessionTcp::recv_from_both() {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
@@ -316,8 +338,10 @@ void ProxySessionTcp::recv_from_destination(const boost::system::error_code &ec,
                                             std::size_t length) {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
 
-  if (ec)
+  if (ec || length == 0) {
+    m_destinationSocket.cancel();
     return;
+  }
 
   m_outBuf += length;
   boost::asio::async_write(
@@ -331,8 +355,10 @@ void ProxySessionTcp::recv_from_client(const boost::system::error_code &ec,
                                        std::size_t length) {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
 
-  if (ec)
+  if (ec || length == 0) {
+    m_destinationSocket.cancel();
     return;
+  }
 
   m_inBuf += length;
   boost::asio::async_write(
@@ -346,8 +372,10 @@ void ProxySessionTcp::handle_client_write(const boost::system::error_code &ec,
                                           std::size_t length) {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
 
-  if (ec)
+  if (ec || length == 0) {
+    m_clientSocket.cancel();
     return;
+  }
 
   m_outBuf -= length;
   m_destinationSocket.async_read_some(
@@ -361,8 +389,10 @@ void ProxySessionTcp::handle_destination_write(
     const boost::system::error_code &ec, std::size_t length) {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
 
-  if (ec)
+  if (ec || length == 0) {
+    m_destinationSocket.cancel();
     return;
+  }
 
   m_inBuf -= length;
   m_clientSocket.async_read_some(
@@ -388,7 +418,8 @@ void ProxyServer::async_accept() {
       [this](const boost::system::error_code &ec, tcp::socket client_socket) {
         if (!ec) {
           auto auth_session = std::make_shared<ProxySessionAuth>(
-              m_nextSessionId++, std::move(client_socket));
+              m_nextSessionId.fetch_add(1, std::memory_order_relaxed),
+              std::move(client_socket));
           if (auth_session)
             auth_session->start();
         }
