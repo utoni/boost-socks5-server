@@ -1,0 +1,3 @@
+[submodule "boost-asio-fastbuffer"]
+	path = boost-asio-fastbuffer
+	url = https://github.com/utoni/boost-asio-fastbuffer.git
