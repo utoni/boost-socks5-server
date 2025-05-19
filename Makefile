@@ -12,7 +12,7 @@ CXXFLAGS += -fsanitize=thread -fsanitize=undefined
 endif
 endif
 ifneq ($(DEBUG),)
-CXXFLAGS += -g #-DBOOST_ASIO_ENABLE_HANDLER_TRACKING=1
+CXXFLAGS += -g3 #-DBOOST_ASIO_ENABLE_HANDLER_TRACKING=1
 endif
 
 all: git server
