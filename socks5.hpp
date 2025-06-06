@@ -64,14 +64,12 @@ protected:
 };
 
 template <typename Executor>
-class AsyncDestinationSocket
-    : public DestinationSocketBase,
-      public std::enable_shared_from_this<AsyncDestinationSocket<Executor>> {
+class AsyncDestinationSocket : public DestinationSocketBase {
 public:
   AsyncDestinationSocket(const Executor &exec) : m_strand(exec) {}
   ~AsyncDestinationSocket() {}
 
-private:
+protected:
   void do_connect_tcp(
       boost::asio::ip::address &address, uint16_t port,
       std::function<void(boost::system::error_code)> handler) override;
@@ -82,9 +80,9 @@ private:
   bool do_read(boost::asio::mutable_buffer buffer,
                std::function<void(boost::system::error_code, std::size_t)>
                    handler) override;
-  bool
-  do_write(boost::asio::mutable_buffer buffer, std::size_t length,
-           std::function<void(boost::system::error_code, std::size_t)> handler);
+  bool do_write(boost::asio::mutable_buffer buffer, std::size_t length,
+                std::function<void(boost::system::error_code, std::size_t)>
+                    handler) override;
   bool cancel() override;
 
   boost::asio::strand<Executor> m_strand;
@@ -142,10 +140,10 @@ private:
                              const boost::system::error_code &ec,
                              std::size_t length);
 
-  std::function<std::unique_ptr<DestinationSocketBase>(
+  std::function<std::shared_ptr<DestinationSocketBase>(
       boost::asio::any_io_executor)>
       m_getDestinationSocket;
-  std::unique_ptr<DestinationSocketBase> m_destinationSocket;
+  std::shared_ptr<DestinationSocketBase> m_destinationSocket;
   boost::asio::ip::tcp::resolver m_resolver;
   boost::asio::ip::address m_destinationAddress;
   std::uint16_t m_destinationPort;
@@ -154,10 +152,15 @@ private:
 class ProxySession : private ProxyBase,
                      public std::enable_shared_from_this<ProxySession> {
 public:
-  explicit ProxySession(std::uint32_t session_id,
-                        boost::asio::ip::tcp::socket &&client_socket,
-                        std::unique_ptr<DestinationSocketBase> &&dest_socket,
-                        std::size_t buffer_size = 65535);
+  ProxySession(std::uint32_t session_id,
+               boost::asio::ip::tcp::socket &&client_socket,
+               std::shared_ptr<DestinationSocketBase> &&dest_socket,
+               std::size_t buffer_size = BUFSIZ);
+  ProxySession(std::uint32_t session_id,
+               boost::asio::ip::tcp::socket &&client_socket,
+               std::shared_ptr<DestinationSocketBase> &&dest_socket,
+               ContiguousStreamBuffer &&input_buffer,
+               ContiguousStreamBuffer &&output_buffer);
   void start();
 
 private:
@@ -171,7 +174,7 @@ private:
   void handle_destination_write(const boost::system::error_code &ec,
                                 std::size_t length);
 
-  std::unique_ptr<DestinationSocketBase> m_destinationSocket;
+  std::shared_ptr<DestinationSocketBase> m_destinationSocket;
 };
 
 class ProxyServer : private boost::noncopyable {
@@ -192,6 +195,39 @@ protected:
 
 // End Of Minimal Implementation
 
+template <typename Executor>
+class LoggingAsyncDestinationSocket : public AsyncDestinationSocket<Executor> {
+public:
+  LoggingAsyncDestinationSocket(const Executor &exec)
+      : AsyncDestinationSocket<Executor>(exec), m_bytesRead{0},
+        m_bytesWritten{0} {}
+  ~LoggingAsyncDestinationSocket() {}
+  std::size_t get_bytes_read() {
+    return m_bytesRead.exchange(0, std::memory_order_relaxed);
+  }
+  std::size_t get_bytes_written() {
+    return m_bytesWritten.exchange(0, std::memory_order_relaxed);
+  }
+
+private:
+  void do_connect_tcp(
+      boost::asio::ip::address &address, uint16_t port,
+      std::function<void(boost::system::error_code)> handler) override;
+  void do_bind_tcp(boost::asio::ip::address &address, uint16_t port,
+                   std::function<void(boost::system::error_code)>) override;
+  void do_bind_udp(boost::asio::ip::address &address, uint16_t port,
+                   std::function<void(boost::system::error_code)>) override;
+  bool do_read(boost::asio::mutable_buffer buffer,
+               std::function<void(boost::system::error_code, std::size_t)>
+                   handler) override;
+  bool
+  do_write(boost::asio::mutable_buffer buffer, std::size_t length,
+           std::function<void(boost::system::error_code, std::size_t)> handler);
+
+  std::atomic<std::size_t> m_bytesRead;
+  std::atomic<std::size_t> m_bytesWritten;
+};
+
 class LoggingProxyServer : public ProxyServer {
 public:
   LoggingProxyServer(boost::asio::io_context &ioc,
@@ -203,6 +239,11 @@ private:
   void async_timer();
   void async_accept() override;
 
-  boost::asio::deadline_timer m_StatusLogger;
+  std::vector<std::weak_ptr<
+      LoggingAsyncDestinationSocket<boost::asio::any_io_executor>>>
+      m_weakDestinationSockets;
+  boost::asio::deadline_timer m_statusLogger;
+  std::atomic<std::size_t> m_bytesRead;
+  std::atomic<std::size_t> m_bytesWritten;
 };
 }; // namespace SOCKS5

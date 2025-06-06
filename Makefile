@@ -14,6 +14,9 @@ endif
 ifneq ($(DEBUG),)
 CXXFLAGS += -g3 #-DBOOST_ASIO_ENABLE_HANDLER_TRACKING=1
 endif
+ifneq ($(HANDLER_TRACKING),)
+CXXFLAGS += -DBOOST_ASIO_ENABLE_HANDLER_TRACKING=1
+endif
 
 all: git server
 
