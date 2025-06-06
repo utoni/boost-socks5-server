@@ -18,72 +18,78 @@
 #include <string>
 
 using namespace SOCKS5;
+using namespace boost;
+using namespace boost::asio;
 using boost::asio::io_context;
 using boost::asio::ip::tcp;
 using boost::asio::ip::udp;
+using namespace boost::system;
 
 template <typename Executor>
 void AsyncDestinationSocket<Executor>::do_connect_tcp(
-    boost::asio::ip::address &address, uint16_t port,
-    std::function<void(boost::system::error_code)> handler) {
-  m_socket.emplace(boost::asio::ip::tcp::socket(m_strand));
-  auto &tcp_socket = boost::get<boost::asio::ip::tcp::socket>(*m_socket);
-  boost::asio::ip::tcp::endpoint endpoint(address, port);
+    ip::address &address, uint16_t port,
+    std::function<void(system::error_code)> handler) {
+  m_socket.emplace(tcp::socket(m_strand));
+  auto &tcp_socket = boost::get<tcp::socket>(*m_socket);
+  tcp::endpoint endpoint(address, port);
   tcp_socket.async_connect(endpoint, std::move(handler));
 }
 
 template <typename Executor>
 void AsyncDestinationSocket<Executor>::do_bind_tcp(
-    boost::asio::ip::address &, uint16_t,
-    std::function<void(boost::system::error_code)>) {
+    ip::address &, uint16_t, std::function<void(system::error_code)>) {
   throw std::runtime_error("TCP Bind not implemented");
 }
 
 template <typename Executor>
 void AsyncDestinationSocket<Executor>::do_bind_udp(
-    boost::asio::ip::address &, uint16_t,
-    std::function<void(boost::system::error_code)>) {
+    ip::address &, uint16_t, std::function<void(system::error_code)>) {
   throw std::runtime_error("UDP Bind not implemented");
 }
 
 template <typename Executor>
 bool AsyncDestinationSocket<Executor>::do_read(
-    boost::asio::mutable_buffer buffer,
-    std::function<void(boost::system::error_code, std::size_t)> handler) {
+    BufferBase &buffer,
+    std::function<void(system::error_code, std::size_t)> handler) {
   if (m_socket) {
-    if (auto *s = boost::get<boost::asio::ip::tcp::socket>(&*m_socket)) {
-      s->async_read_some(buffer, std::move(handler));
+    if (auto *s = boost::get<tcp::socket>(&*m_socket)) {
+      s->async_read_some(+buffer, std::move(handler));
       return true;
     }
+  } else if (auto *s = boost::get<tcp::acceptor>(&*m_socket)) {
+    throw std::runtime_error("TCP Bind (Read) not implemented");
+  } else if (auto *s = boost::get<udp::socket>(&*m_socket)) {
+    throw std::runtime_error("UDP Bind (Read) not implemented");
   }
   return false;
 };
 
 template <typename Executor>
 bool AsyncDestinationSocket<Executor>::do_write(
-    boost::asio::mutable_buffer buffer, std::size_t length,
-    std::function<void(boost::system::error_code, std::size_t)> handler) {
+    BufferBase &buffer, std::size_t length,
+    std::function<void(system::error_code, std::size_t)> handler) {
   if (m_socket) {
-    if (auto *s = boost::get<boost::asio::ip::tcp::socket>(&*m_socket)) {
-      boost::asio::async_write(*s, buffer,
-                               boost::asio::transfer_exactly(length),
-                               std::move(handler));
+    if (auto *s = boost::get<tcp::socket>(&*m_socket)) {
+      async_write(*s, -buffer, transfer_exactly(length), std::move(handler));
       return true;
     }
+  } else if (auto *s = boost::get<tcp::acceptor>(&*m_socket)) {
+    throw std::runtime_error("TCP Bind (Write) not implemented");
+  } else if (auto *s = boost::get<udp::socket>(&*m_socket)) {
+    throw std::runtime_error("UDP Bind (Write) not implemented");
   }
   return false;
 };
 
 template <typename Executor> bool AsyncDestinationSocket<Executor>::cancel() {
   if (m_socket) {
-    if (auto *s = boost::get<boost::asio::ip::tcp::socket>(&*m_socket)) {
+    if (auto *s = boost::get<tcp::socket>(&*m_socket)) {
       s->cancel();
       return true;
-    } else if (auto *s = boost::get<boost::asio::ip::udp::socket>(&*m_socket)) {
+    } else if (auto *s = boost::get<tcp::acceptor>(&*m_socket)) {
       s->cancel();
       return true;
-    } else if (auto *s =
-                   boost::get<boost::asio::ip::tcp::acceptor>(&*m_socket)) {
+    } else if (auto *s = boost::get<udp::socket>(&*m_socket)) {
       s->cancel();
       return true;
     }
@@ -96,8 +102,7 @@ ProxyBase::ProxyBase(std::uint32_t session_id, tcp::socket &&client_socket,
     : m_sessionId{session_id}, m_inBuf{buffer_size}, m_outBuf{buffer_size},
       m_clientSocket{std::move(client_socket)} {}
 
-ProxyBase::ProxyBase(std::uint32_t session_id,
-                     boost::asio::ip::tcp::socket &&client_socket,
+ProxyBase::ProxyBase(std::uint32_t session_id, tcp::socket &&client_socket,
                      ContiguousStreamBuffer &&input_buffer,
                      ContiguousStreamBuffer &&output_buffer)
     : m_sessionId{session_id}, m_inBuf{std::move(input_buffer)},
@@ -111,14 +116,13 @@ ProxyAuth::ProxyAuth(std::uint32_t session_id, tcp::socket &&client_socket)
 void ProxyAuth::start_internal() {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
 
-  boost::asio::async_read(
-      m_clientSocket, +m_inBuf, boost::asio::transfer_at_least(2),
-      boost::bind(&ProxyAuth::recv_client_greeting, shared_from_this(),
-                  boost::asio::placeholders::error,
-                  boost::asio::placeholders::bytes_transferred));
+  async_read(m_clientSocket, +m_inBuf, transfer_at_least(2),
+             boost::bind(&ProxyAuth::recv_client_greeting, shared_from_this(),
+                         asio::placeholders::error,
+                         asio::placeholders::bytes_transferred));
 }
 
-void ProxyAuth::recv_client_greeting(const boost::system::error_code &ec,
+void ProxyAuth::recv_client_greeting(const system::error_code &ec,
                                      std::size_t length) {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
 
@@ -130,12 +134,11 @@ void ProxyAuth::recv_client_greeting(const boost::system::error_code &ec,
     return;
   const std::size_t expected_size = std::size_t(2) + m_inBuf[1];
   if (m_inBuf.size() < expected_size) {
-    boost::asio::async_read(
-        m_clientSocket, +m_inBuf,
-        boost::asio::transfer_at_least(expected_size - m_inBuf.size()),
-        boost::bind(&ProxyAuth::recv_client_greeting, shared_from_this(),
-                    boost::asio::placeholders::error,
-                    boost::asio::placeholders::bytes_transferred));
+    async_read(m_clientSocket, +m_inBuf,
+               transfer_at_least(expected_size - m_inBuf.size()),
+               boost::bind(&ProxyAuth::recv_client_greeting, shared_from_this(),
+                           asio::placeholders::error,
+                           asio::placeholders::bytes_transferred));
     return;
   }
 
@@ -158,20 +161,20 @@ void ProxyAuth::send_server_greeting(bool auth_supported) {
     m_outBuf += {0x05, 0xFF};
     m_clientSocket.async_send(
         -m_outBuf, boost::bind(&ProxyAuth::handle_write, shared_from_this(),
-                               boost::asio::placeholders::error,
-                               boost::asio::placeholders::bytes_transferred));
+                               asio::placeholders::error,
+                               asio::placeholders::bytes_transferred));
     return;
   }
 
   m_outBuf += {0x05, 0x00};
   m_clientSocket.async_send(
       -m_outBuf, boost::bind(&ProxyAuth::handle_write, shared_from_this(),
-                             boost::asio::placeholders::error,
-                             boost::asio::placeholders::bytes_transferred));
+                             asio::placeholders::error,
+                             asio::placeholders::bytes_transferred));
   process_connection_request();
 }
 
-void ProxyAuth::recv_connection_request(const boost::system::error_code &ec,
+void ProxyAuth::recv_connection_request(const system::error_code &ec,
                                         std::size_t length) {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
 
@@ -185,12 +188,10 @@ void ProxyAuth::process_connection_request() {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
 
   if (m_inBuf.size() < 6) {
-    boost::asio::async_read(
-        m_clientSocket, +m_inBuf,
-        boost::asio::transfer_at_least(6 - m_inBuf.size()),
-        boost::bind(&ProxyAuth::recv_connection_request, shared_from_this(),
-                    boost::asio::placeholders::error,
-                    boost::asio::placeholders::bytes_transferred));
+    async_read(m_clientSocket, +m_inBuf, transfer_at_least(6 - m_inBuf.size()),
+               boost::bind(&ProxyAuth::recv_connection_request,
+                           shared_from_this(), asio::placeholders::error,
+                           asio::placeholders::bytes_transferred));
     return;
   }
 
@@ -219,12 +220,11 @@ void ProxyAuth::process_connection_request() {
 
   expected_size += std::size_t(6) + address_size;
   if (m_inBuf.size() < expected_size) {
-    boost::asio::async_read(
-        m_clientSocket, +m_inBuf,
-        boost::asio::transfer_at_least(expected_size - m_inBuf.size()),
-        boost::bind(&ProxyAuth::recv_connection_request, shared_from_this(),
-                    boost::asio::placeholders::error,
-                    boost::asio::placeholders::bytes_transferred));
+    async_read(m_clientSocket, +m_inBuf,
+               transfer_at_least(expected_size - m_inBuf.size()),
+               boost::bind(&ProxyAuth::recv_connection_request,
+                           shared_from_this(), asio::placeholders::error,
+                           asio::placeholders::bytes_transferred));
     return;
   }
 
@@ -232,7 +232,7 @@ void ProxyAuth::process_connection_request() {
   switch (m_inBuf[3]) {
   case 0x01: {
     auto ip4_bytes = ::ntohl(*reinterpret_cast<const uint32_t *>(m_inBuf(4)));
-    m_destinationAddress = boost::asio::ip::make_address_v4(ip4_bytes);
+    m_destinationAddress = ip::make_address_v4(ip4_bytes);
     m_destinationPort =
         ::ntohs(*reinterpret_cast<const uint16_t *>(m_inBuf(4 + address_size)));
     connect_to_destination(proxy_cmd);
@@ -249,7 +249,7 @@ void ProxyAuth::process_connection_request() {
   case 0x04: {
     auto ip6_array =
         *reinterpret_cast<const std::array<std::uint8_t, 16> *>(m_inBuf(4));
-    m_destinationAddress = boost::asio::ip::make_address_v6(ip6_array);
+    m_destinationAddress = ip::make_address_v6(ip6_array);
     m_destinationPort =
         ::ntohs(*reinterpret_cast<const uint16_t *>(m_inBuf(4 + address_size)));
     connect_to_destination(proxy_cmd);
@@ -283,11 +283,11 @@ void ProxyAuth::send_server_response(std::uint8_t proxy_cmd,
   const auto port = ::htons(m_destinationPort);
   m_outBuf += {static_cast<uint8_t>(port & 0x00FF),
                static_cast<uint8_t>((port & 0xFF00) >> 8)};
-  m_clientSocket.async_send(
-      -m_outBuf,
-      boost::bind(&ProxyAuth::handle_response_write, shared_from_this(),
-                  proxy_cmd, status_code, boost::asio::placeholders::error,
-                  boost::asio::placeholders::bytes_transferred));
+  m_clientSocket.async_send(-m_outBuf,
+                            boost::bind(&ProxyAuth::handle_response_write,
+                                        shared_from_this(), proxy_cmd,
+                                        status_code, asio::placeholders::error,
+                                        asio::placeholders::bytes_transferred));
 }
 
 void ProxyAuth::resolve_destination_host(std::uint8_t proxy_cmd,
@@ -297,7 +297,7 @@ void ProxyAuth::resolve_destination_host(std::uint8_t proxy_cmd,
 
   m_resolver.async_resolve(host, std::to_string(port),
                            [this, self = shared_from_this(),
-                            proxy_cmd](const boost::system::error_code &ec,
+                            proxy_cmd](const system::error_code &ec,
                                        const tcp::resolver::iterator &it) {
                              if (ec) {
                                send_server_response(proxy_cmd, 0x04);
@@ -315,14 +315,13 @@ void ProxyAuth::resolve_destination_host(std::uint8_t proxy_cmd,
 void ProxyAuth::connect_to_destination(std::uint8_t proxy_cmd) {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
 
-  const auto check_error = [this,
-                            proxy_cmd](const boost::system::error_code &ec) {
+  const auto check_error = [this, proxy_cmd](const system::error_code &ec) {
     if (ec) {
-      if (ec == boost::system::errc::connection_refused)
+      if (ec == system::errc::connection_refused)
         send_server_response(proxy_cmd, 0x05);
-      else if (ec == boost::system::errc::network_unreachable)
+      else if (ec == system::errc::network_unreachable)
         send_server_response(proxy_cmd, 0x03);
-      else if (ec == boost::system::errc::host_unreachable)
+      else if (ec == system::errc::host_unreachable)
         send_server_response(proxy_cmd, 0x04);
       else
         send_server_response(proxy_cmd, 0x01);
@@ -344,7 +343,7 @@ void ProxyAuth::connect_to_destination(std::uint8_t proxy_cmd) {
     m_destinationSocket->connect_tcp(
         m_destinationAddress, m_destinationPort,
         [this, self = shared_from_this(), check_error,
-         proxy_cmd](const boost::system::error_code &ec) { check_error(ec); });
+         proxy_cmd](const system::error_code &ec) { check_error(ec); });
     return;
   }
   case 0x02: // TCP port bind
@@ -352,7 +351,7 @@ void ProxyAuth::connect_to_destination(std::uint8_t proxy_cmd) {
     m_destinationSocket->tcp_bind(
         m_destinationAddress, m_destinationPort,
         [this, self = shared_from_this(), check_error,
-         proxy_cmd](const boost::system::error_code &ec) { check_error(ec); });
+         proxy_cmd](const system::error_code &ec) { check_error(ec); });
     return;
   }
   case 0x03: // UDP port bind
@@ -360,7 +359,7 @@ void ProxyAuth::connect_to_destination(std::uint8_t proxy_cmd) {
     m_destinationSocket->udp_bind(
         m_destinationAddress, m_destinationPort,
         [this, self = shared_from_this(), check_error,
-         proxy_cmd](const boost::system::error_code &ec) { check_error(ec); });
+         proxy_cmd](const system::error_code &ec) { check_error(ec); });
     return;
   }
   default:
@@ -369,8 +368,7 @@ void ProxyAuth::connect_to_destination(std::uint8_t proxy_cmd) {
   }
 }
 
-void ProxyAuth::handle_write(const boost::system::error_code &ec,
-                             std::size_t length) {
+void ProxyAuth::handle_write(const system::error_code &ec, std::size_t length) {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
 
   if (ec || length == 0)
@@ -380,13 +378,13 @@ void ProxyAuth::handle_write(const boost::system::error_code &ec,
   if (m_outBuf.size() > 0)
     m_clientSocket.async_send(
         -m_outBuf, boost::bind(&ProxyAuth::handle_write, shared_from_this(),
-                               boost::asio::placeholders::error,
-                               boost::asio::placeholders::bytes_transferred));
+                               asio::placeholders::error,
+                               asio::placeholders::bytes_transferred));
 }
 
 void ProxyAuth::handle_response_write(std::uint8_t proxy_cmd,
                                       std::uint8_t status_code,
-                                      const boost::system::error_code &ec,
+                                      const system::error_code &ec,
                                       std::size_t length) {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
 
@@ -398,8 +396,8 @@ void ProxyAuth::handle_response_write(std::uint8_t proxy_cmd,
     m_clientSocket.async_send(
         -m_outBuf,
         boost::bind(&ProxyAuth::handle_response_write, shared_from_this(),
-                    proxy_cmd, status_code, boost::asio::placeholders::error,
-                    boost::asio::placeholders::bytes_transferred));
+                    proxy_cmd, status_code, asio::placeholders::error,
+                    asio::placeholders::bytes_transferred));
     return;
   }
 
@@ -416,14 +414,14 @@ void ProxyAuth::handle_response_write(std::uint8_t proxy_cmd,
 }
 
 ProxySession::ProxySession(std::uint32_t session_id,
-                           boost::asio::ip::tcp::socket &&client_socket,
+                           tcp::socket &&client_socket,
                            std::shared_ptr<DestinationSocketBase> &&dest_socket,
                            std::size_t buffer_size)
     : ProxyBase(session_id, std::move(client_socket), buffer_size),
       m_destinationSocket(std::move(dest_socket)) {}
 
 ProxySession::ProxySession(std::uint32_t session_id,
-                           boost::asio::ip::tcp::socket &&client_socket,
+                           tcp::socket &&client_socket,
                            std::shared_ptr<DestinationSocketBase> &&dest_socket,
                            ContiguousStreamBuffer &&input_buffer,
                            ContiguousStreamBuffer &&output_buffer)
@@ -438,16 +436,15 @@ void ProxySession::recv_from_both() {
 
   m_clientSocket.async_read_some(
       +m_inBuf, boost::bind(&ProxySession::recv_from_client, shared_from_this(),
-                            boost::asio::placeholders::error,
-                            boost::asio::placeholders::bytes_transferred));
+                            asio::placeholders::error,
+                            asio::placeholders::bytes_transferred));
   m_destinationSocket->read(
-      +m_outBuf,
-      boost::bind(&ProxySession::recv_from_destination, shared_from_this(),
-                  boost::asio::placeholders::error,
-                  boost::asio::placeholders::bytes_transferred));
+      m_outBuf, boost::bind(&ProxySession::recv_from_destination,
+                            shared_from_this(), asio::placeholders::error,
+                            asio::placeholders::bytes_transferred));
 }
 
-void ProxySession::recv_from_destination(const boost::system::error_code &ec,
+void ProxySession::recv_from_destination(const system::error_code &ec,
                                          std::size_t length) {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
 
@@ -457,14 +454,13 @@ void ProxySession::recv_from_destination(const boost::system::error_code &ec,
   }
 
   m_outBuf += length;
-  boost::asio::async_write(
-      m_clientSocket, -m_outBuf, boost::asio::transfer_all(),
-      boost::bind(&ProxySession::handle_client_write, shared_from_this(),
-                  boost::asio::placeholders::error,
-                  boost::asio::placeholders::bytes_transferred));
+  async_write(m_clientSocket, -m_outBuf, transfer_all(),
+              boost::bind(&ProxySession::handle_client_write,
+                          shared_from_this(), asio::placeholders::error,
+                          asio::placeholders::bytes_transferred));
 }
 
-void ProxySession::recv_from_client(const boost::system::error_code &ec,
+void ProxySession::recv_from_client(const system::error_code &ec,
                                     std::size_t length) {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
 
@@ -475,13 +471,13 @@ void ProxySession::recv_from_client(const boost::system::error_code &ec,
 
   m_inBuf += length;
   m_destinationSocket->write(
-      -m_inBuf, length,
+      m_inBuf, length,
       boost::bind(&ProxySession::handle_destination_write, shared_from_this(),
-                  boost::asio::placeholders::error,
-                  boost::asio::placeholders::bytes_transferred));
+                  asio::placeholders::error,
+                  asio::placeholders::bytes_transferred));
 }
 
-void ProxySession::handle_client_write(const boost::system::error_code &ec,
+void ProxySession::handle_client_write(const system::error_code &ec,
                                        std::size_t length) {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
 
@@ -492,13 +488,12 @@ void ProxySession::handle_client_write(const boost::system::error_code &ec,
 
   m_outBuf -= length;
   m_destinationSocket->read(
-      +m_outBuf,
-      boost::bind(&ProxySession::recv_from_destination, shared_from_this(),
-                  boost::asio::placeholders::error,
-                  boost::asio::placeholders::bytes_transferred));
+      m_outBuf, boost::bind(&ProxySession::recv_from_destination,
+                            shared_from_this(), asio::placeholders::error,
+                            asio::placeholders::bytes_transferred));
 }
 
-void ProxySession::handle_destination_write(const boost::system::error_code &ec,
+void ProxySession::handle_destination_write(const system::error_code &ec,
                                             std::size_t length) {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
 
@@ -510,8 +505,8 @@ void ProxySession::handle_destination_write(const boost::system::error_code &ec,
   m_inBuf -= length;
   m_clientSocket.async_read_some(
       +m_inBuf, boost::bind(&ProxySession::recv_from_client, shared_from_this(),
-                            boost::asio::placeholders::error,
-                            boost::asio::placeholders::bytes_transferred));
+                            asio::placeholders::error,
+                            asio::placeholders::bytes_transferred));
 }
 
 ProxyServer::ProxyServer(io_context &ioc, const tcp::endpoint &local_endpoint)
@@ -519,8 +514,8 @@ ProxyServer::ProxyServer(io_context &ioc, const tcp::endpoint &local_endpoint)
 
 ProxyServer::ProxyServer(io_context &ioc, const std::string &listen_addr,
                          std::uint16_t listen_port)
-    : ProxyServer(ioc, tcp::endpoint(boost::asio::ip::make_address(listen_addr),
-                                     listen_port)) {}
+    : ProxyServer(ioc,
+                  tcp::endpoint(ip::make_address(listen_addr), listen_port)) {}
 
 void ProxyServer::start() { async_accept(); }
 
@@ -528,18 +523,16 @@ void ProxyServer::stop() { m_acceptor.cancel(); }
 
 void ProxyServer::async_accept() {
   m_acceptor.async_accept(
-      boost::asio::make_strand(m_acceptor.get_executor()),
-      [this](const boost::system::error_code &ec, tcp::socket client_socket) {
+      make_strand(m_acceptor.get_executor()),
+      [this](const system::error_code &ec, tcp::socket client_socket) {
         if (!ec) {
           auto auth_session = std::make_shared<ProxyAuth>(
               m_nextSessionId.fetch_add(1, std::memory_order_relaxed),
               std::move(client_socket));
 
           if (auth_session) {
-            auth_session->start([](boost::asio::any_io_executor exec) {
-              auto aptr =
-                  new AsyncDestinationSocket<boost::asio::any_io_executor>(
-                      exec);
+            auth_session->start([](any_io_executor exec) {
+              auto aptr = new AsyncDestinationSocket<any_io_executor>(exec);
               return std::shared_ptr<DestinationSocketBase>(std::move(aptr));
             });
           }
@@ -550,8 +543,8 @@ void ProxyServer::async_accept() {
 
 template <typename Executor>
 void LoggingAsyncDestinationSocket<Executor>::do_connect_tcp(
-    boost::asio::ip::address &address, uint16_t port,
-    std::function<void(boost::system::error_code)> handler) {
+    ip::address &address, uint16_t port,
+    std::function<void(system::error_code)> handler) {
   std::cout << "LoggingProxyServer::do_connect_tcp(): " << address.to_string()
             << ":" << port << "\n";
   AsyncDestinationSocket<Executor>::do_connect_tcp(address, port, handler);
@@ -559,8 +552,8 @@ void LoggingAsyncDestinationSocket<Executor>::do_connect_tcp(
 
 template <typename Executor>
 void LoggingAsyncDestinationSocket<Executor>::do_bind_tcp(
-    boost::asio::ip::address &address, uint16_t port,
-    std::function<void(boost::system::error_code)> handler) {
+    ip::address &address, uint16_t port,
+    std::function<void(system::error_code)> handler) {
   std::cout << "LoggingProxyServer::do_bind_tcp(): " << address.to_string()
             << ":" << port << "\n";
   AsyncDestinationSocket<Executor>::do_bind_tcp(address, port, handler);
@@ -568,8 +561,8 @@ void LoggingAsyncDestinationSocket<Executor>::do_bind_tcp(
 
 template <typename Executor>
 void LoggingAsyncDestinationSocket<Executor>::do_bind_udp(
-    boost::asio::ip::address &address, uint16_t port,
-    std::function<void(boost::system::error_code)> handler) {
+    ip::address &address, uint16_t port,
+    std::function<void(system::error_code)> handler) {
   std::cout << "LoggingProxyServer::do_bind_udp(): " << address.to_string()
             << ":" << port << "\n";
   AsyncDestinationSocket<Executor>::do_bind_udp(address, port, handler);
@@ -577,11 +570,10 @@ void LoggingAsyncDestinationSocket<Executor>::do_bind_udp(
 
 template <typename Executor>
 bool LoggingAsyncDestinationSocket<Executor>::do_read(
-    boost::asio::mutable_buffer buffer,
-    std::function<void(boost::system::error_code, std::size_t)> handler) {
+    BufferBase &buffer,
+    std::function<void(system::error_code, std::size_t)> handler) {
   return AsyncDestinationSocket<Executor>::do_read(
-      buffer,
-      [this, handler](boost::system::error_code ec, std::size_t length) {
+      buffer, [this, handler](system::error_code ec, std::size_t length) {
         m_bytesRead.fetch_add(length, std::memory_order_relaxed);
         handler(ec, length);
       });
@@ -589,17 +581,17 @@ bool LoggingAsyncDestinationSocket<Executor>::do_read(
 
 template <typename Executor>
 bool LoggingAsyncDestinationSocket<Executor>::do_write(
-    boost::asio::mutable_buffer buffer, std::size_t length,
-    std::function<void(boost::system::error_code, std::size_t)> handler) {
+    BufferBase &buffer, std::size_t length,
+    std::function<void(system::error_code, std::size_t)> handler) {
   return AsyncDestinationSocket<Executor>::do_write(
       buffer, length,
-      [this, handler](boost::system::error_code ec, std::size_t length) {
+      [this, handler](system::error_code ec, std::size_t length) {
         m_bytesWritten.fetch_add(length, std::memory_order_relaxed);
         handler(ec, length);
       });
 }
 
-LoggingProxyServer::LoggingProxyServer(boost::asio::io_context &ioc,
+LoggingProxyServer::LoggingProxyServer(io_context &ioc,
                                        const std::string &listen_addr,
                                        std::uint16_t listen_port)
     : ProxyServer(ioc, listen_addr, listen_port), m_statusLogger(ioc),
@@ -619,7 +611,7 @@ void LoggingProxyServer::stop() {
 
 void LoggingProxyServer::async_timer() {
   m_statusLogger.expires_from_now(boost::posix_time::seconds(1));
-  m_statusLogger.async_wait([this](const boost::system::error_code &ec) {
+  m_statusLogger.async_wait([this](const system::error_code &ec) {
     if (ec) {
       std::cout << "LoggingProxyServer::async_timer() ERROR: " << ec << "\n";
       return;
@@ -635,10 +627,12 @@ void LoggingProxyServer::async_timer() {
       m_bytesWritten += shared_ds->get_bytes_written();
     }
     m_weakDestinationSockets.erase(
-        std::remove_if(
-            m_weakDestinationSockets.begin(), m_weakDestinationSockets.end(),
-            [](const std::weak_ptr<LoggingAsyncDestinationSocket<
-                   boost::asio::any_io_executor>> &w) { return w.expired(); }),
+        std::remove_if(m_weakDestinationSockets.begin(),
+                       m_weakDestinationSockets.end(),
+                       [](const std::weak_ptr<
+                           LoggingAsyncDestinationSocket<any_io_executor>> &w) {
+                         return w.expired();
+                       }),
         m_weakDestinationSockets.end());
     std::cout << "LoggingProxyServer::async_timer(): served "
               << m_nextSessionId.load(std::memory_order_relaxed) - 1
@@ -651,8 +645,8 @@ void LoggingProxyServer::async_timer() {
 
 void LoggingProxyServer::async_accept() {
   m_acceptor.async_accept(
-      boost::asio::make_strand(m_acceptor.get_executor()),
-      [this](const boost::system::error_code &ec, tcp::socket client_socket) {
+      make_strand(m_acceptor.get_executor()),
+      [this](const system::error_code &ec, tcp::socket client_socket) {
         if (!ec) {
           auto const client_endpoint = client_socket.remote_endpoint();
           std::cout << "LoggingProxyServer::async_accept() ACCEPT: id "
@@ -665,12 +659,10 @@ void LoggingProxyServer::async_accept() {
               std::move(client_socket));
 
           if (auth_session) {
-            auth_session->start([this](boost::asio::any_io_executor exec) {
+            auth_session->start([this](any_io_executor exec) {
               auto shared_ptr = std::make_shared<
-                  LoggingAsyncDestinationSocket<boost::asio::any_io_executor>>(
-                  exec);
-              std::weak_ptr<
-                  LoggingAsyncDestinationSocket<boost::asio::any_io_executor>>
+                  LoggingAsyncDestinationSocket<any_io_executor>>(exec);
+              std::weak_ptr<LoggingAsyncDestinationSocket<any_io_executor>>
                   weak_ptr(shared_ptr);
               m_weakDestinationSockets.push_back(weak_ptr);
               return shared_ptr;
@@ -680,6 +672,53 @@ void LoggingProxyServer::async_accept() {
           std::cout << "LoggingProxyServer::async_accept() ERROR: " << ec
                     << "\n";
           return;
+        }
+        async_accept();
+      });
+}
+
+template <typename Executor>
+bool CustomProtocolAsyncDestinationSocket<Executor>::do_read(
+    BufferBase &buffer,
+    std::function<void(system::error_code, std::size_t)> handler) {
+  buffer += {'C', 'U', 'S', 'T', 'O', 'M'};
+  return AsyncDestinationSocket<Executor>::do_read(buffer, handler);
+}
+
+template <typename Executor>
+bool CustomProtocolAsyncDestinationSocket<Executor>::do_write(
+    BufferBase &buffer, std::size_t length,
+    std::function<void(system::error_code, std::size_t)> handler) {
+  buffer += {'P', 'R', 'O', 'T', 'O', 'C', 'O', 'L'};
+  return AsyncDestinationSocket<Executor>::do_write(buffer, length + 8,
+                                                    handler);
+}
+
+CustomProtocolProxyServer::CustomProtocolProxyServer(
+    io_context &ioc, const std::string &listen_addr, std::uint16_t listen_port)
+    : ProxyServer(ioc, listen_addr, listen_port) {}
+
+void CustomProtocolProxyServer::start() { ProxyServer::start(); }
+
+void CustomProtocolProxyServer::stop() { ProxyServer::stop(); }
+
+void CustomProtocolProxyServer::async_accept() {
+  m_acceptor.async_accept(
+      make_strand(m_acceptor.get_executor()),
+      [this](const system::error_code &ec, tcp::socket client_socket) {
+        if (!ec) {
+          auto auth_session = std::make_shared<ProxyAuth>(
+              m_nextSessionId.fetch_add(1, std::memory_order_relaxed),
+              std::move(client_socket));
+
+          if (auth_session) {
+            auth_session->start([](any_io_executor exec) {
+              auto aptr =
+                  new CustomProtocolAsyncDestinationSocket<any_io_executor>(
+                      exec);
+              return std::shared_ptr<DestinationSocketBase>(std::move(aptr));
+            });
+          }
         }
         async_accept();
       });

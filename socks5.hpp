@@ -37,12 +37,11 @@ public:
     do_bind_udp(address, port, std::forward<Callback>(handler));
   }
   template <typename Callback>
-  bool read(boost::asio::mutable_buffer buffer, Callback &&handler) {
+  bool read(BufferBase &buffer, Callback &&handler) {
     return do_read(buffer, std::forward<Callback>(handler));
   }
   template <typename Callback>
-  bool write(boost::asio::mutable_buffer buffer, std::size_t length,
-             Callback &&handler) {
+  bool write(BufferBase &buffer, std::size_t length, Callback &&handler) {
     return do_write(buffer, length, std::forward<Callback>(handler));
   }
   virtual bool cancel() = 0;
@@ -56,10 +55,10 @@ protected:
   virtual void do_bind_udp(boost::asio::ip::address &address, uint16_t port,
                            std::function<void(boost::system::error_code)>) = 0;
   virtual bool
-      do_read(boost::asio::mutable_buffer,
-              std::function<void(boost::system::error_code, std::size_t)>) = 0;
+  do_read(BufferBase &,
+          std::function<void(boost::system::error_code, std::size_t)>) = 0;
   virtual bool
-  do_write(boost::asio::mutable_buffer, std::size_t,
+  do_write(BufferBase &, std::size_t,
            std::function<void(boost::system::error_code, std::size_t)>) = 0;
 };
 
@@ -77,10 +76,10 @@ protected:
                    std::function<void(boost::system::error_code)>) override;
   void do_bind_udp(boost::asio::ip::address &address, uint16_t port,
                    std::function<void(boost::system::error_code)>) override;
-  bool do_read(boost::asio::mutable_buffer buffer,
+  bool do_read(BufferBase &buffer,
                std::function<void(boost::system::error_code, std::size_t)>
                    handler) override;
-  bool do_write(boost::asio::mutable_buffer buffer, std::size_t length,
+  bool do_write(BufferBase &buffer, std::size_t length,
                 std::function<void(boost::system::error_code, std::size_t)>
                     handler) override;
   bool cancel() override;
@@ -217,11 +216,11 @@ private:
                    std::function<void(boost::system::error_code)>) override;
   void do_bind_udp(boost::asio::ip::address &address, uint16_t port,
                    std::function<void(boost::system::error_code)>) override;
-  bool do_read(boost::asio::mutable_buffer buffer,
+  bool do_read(BufferBase &buffer,
                std::function<void(boost::system::error_code, std::size_t)>
                    handler) override;
   bool
-  do_write(boost::asio::mutable_buffer buffer, std::size_t length,
+  do_write(BufferBase &buffer, std::size_t length,
            std::function<void(boost::system::error_code, std::size_t)> handler);
 
   std::atomic<std::size_t> m_bytesRead;
@@ -246,4 +245,37 @@ private:
   std::atomic<std::size_t> m_bytesRead;
   std::atomic<std::size_t> m_bytesWritten;
 };
+
+// The following is just an example if you want to use a custom proxy/tunnel
+// protocol ;)
+
+template <typename Executor>
+class CustomProtocolAsyncDestinationSocket
+    : public AsyncDestinationSocket<Executor> {
+public:
+  CustomProtocolAsyncDestinationSocket(const Executor &exec)
+      : AsyncDestinationSocket<Executor>(exec) {}
+  ~CustomProtocolAsyncDestinationSocket() {}
+
+private:
+  bool do_read(BufferBase &buffer,
+               std::function<void(boost::system::error_code, std::size_t)>
+                   handler) override;
+  bool
+  do_write(BufferBase &buffer, std::size_t length,
+           std::function<void(boost::system::error_code, std::size_t)> handler);
+};
+
+class CustomProtocolProxyServer : public ProxyServer {
+public:
+  CustomProtocolProxyServer(boost::asio::io_context &ioc,
+                            const std::string &listen_addr,
+                            std::uint16_t listen_port);
+  void start();
+  void stop();
+
+private:
+  void async_accept() override;
+};
+
 }; // namespace SOCKS5
