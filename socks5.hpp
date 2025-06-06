@@ -219,9 +219,9 @@ private:
   bool do_read(BufferBase &buffer,
                std::function<void(boost::system::error_code, std::size_t)>
                    handler) override;
-  bool
-  do_write(BufferBase &buffer, std::size_t length,
-           std::function<void(boost::system::error_code, std::size_t)> handler);
+  bool do_write(BufferBase &buffer, std::size_t length,
+                std::function<void(boost::system::error_code, std::size_t)>
+                    handler) override;
 
   std::atomic<std::size_t> m_bytesRead;
   std::atomic<std::size_t> m_bytesWritten;
@@ -261,9 +261,9 @@ private:
   bool do_read(BufferBase &buffer,
                std::function<void(boost::system::error_code, std::size_t)>
                    handler) override;
-  bool
-  do_write(BufferBase &buffer, std::size_t length,
-           std::function<void(boost::system::error_code, std::size_t)> handler);
+  bool do_write(BufferBase &buffer, std::size_t length,
+                std::function<void(boost::system::error_code, std::size_t)>
+                    handler) override;
 };
 
 class CustomProtocolProxyServer : public ProxyServer {

@@ -342,24 +342,27 @@ void ProxyAuth::connect_to_destination(std::uint8_t proxy_cmd) {
   {
     m_destinationSocket->connect_tcp(
         m_destinationAddress, m_destinationPort,
-        [this, self = shared_from_this(), check_error,
-         proxy_cmd](const system::error_code &ec) { check_error(ec); });
+        [self = shared_from_this(), check_error](const system::error_code &ec) {
+          check_error(ec);
+        });
     return;
   }
   case 0x02: // TCP port bind
   {
     m_destinationSocket->tcp_bind(
         m_destinationAddress, m_destinationPort,
-        [this, self = shared_from_this(), check_error,
-         proxy_cmd](const system::error_code &ec) { check_error(ec); });
+        [self = shared_from_this(), check_error](const system::error_code &ec) {
+          check_error(ec);
+        });
     return;
   }
   case 0x03: // UDP port bind
   {
     m_destinationSocket->udp_bind(
         m_destinationAddress, m_destinationPort,
-        [this, self = shared_from_this(), check_error,
-         proxy_cmd](const system::error_code &ec) { check_error(ec); });
+        [self = shared_from_this(), check_error](const system::error_code &ec) {
+          check_error(ec);
+        });
     return;
   }
   default:
