@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
 
 using namespace SOCKS5;
@@ -22,29 +23,17 @@ using namespace boost;
 using namespace boost::asio;
 using boost::asio::io_context;
 using boost::asio::ip::tcp;
-using boost::asio::ip::udp;
 using namespace boost::system;
+
+static std::mutex g_loggingMutex;
 
 template <typename Executor>
 void AsyncDestinationSocket<Executor>::do_connect_tcp(
-    ip::address &address, uint16_t port,
+    boost::asio::ip::tcp::resolver::results_type::const_iterator &it,
     std::function<void(system::error_code)> handler) {
   m_socket.emplace(tcp::socket(m_strand));
   auto &tcp_socket = boost::get<tcp::socket>(*m_socket);
-  tcp::endpoint endpoint(address, port);
-  tcp_socket.async_connect(endpoint, std::move(handler));
-}
-
-template <typename Executor>
-void AsyncDestinationSocket<Executor>::do_bind_tcp(
-    ip::address &, uint16_t, std::function<void(system::error_code)>) {
-  throw std::runtime_error("TCP Bind not implemented");
-}
-
-template <typename Executor>
-void AsyncDestinationSocket<Executor>::do_bind_udp(
-    ip::address &, uint16_t, std::function<void(system::error_code)>) {
-  throw std::runtime_error("UDP Bind not implemented");
+  tcp_socket.async_connect(it->endpoint(), std::move(handler));
 }
 
 template <typename Executor>
@@ -56,13 +45,9 @@ bool AsyncDestinationSocket<Executor>::do_read(
       s->async_read_some(+buffer, std::move(handler));
       return true;
     }
-  } else if (auto *s = boost::get<tcp::acceptor>(&*m_socket)) {
-    throw std::runtime_error("TCP Bind (Read) not implemented");
-  } else if (auto *s = boost::get<udp::socket>(&*m_socket)) {
-    throw std::runtime_error("UDP Bind (Read) not implemented");
   }
   return false;
-};
+}
 
 template <typename Executor>
 bool AsyncDestinationSocket<Executor>::do_write(
@@ -73,23 +58,13 @@ bool AsyncDestinationSocket<Executor>::do_write(
       async_write(*s, -buffer, transfer_exactly(length), std::move(handler));
       return true;
     }
-  } else if (auto *s = boost::get<tcp::acceptor>(&*m_socket)) {
-    throw std::runtime_error("TCP Bind (Write) not implemented");
-  } else if (auto *s = boost::get<udp::socket>(&*m_socket)) {
-    throw std::runtime_error("UDP Bind (Write) not implemented");
   }
   return false;
-};
+}
 
 template <typename Executor> bool AsyncDestinationSocket<Executor>::cancel() {
   if (m_socket) {
     if (auto *s = boost::get<tcp::socket>(&*m_socket)) {
-      s->cancel();
-      return true;
-    } else if (auto *s = boost::get<tcp::acceptor>(&*m_socket)) {
-      s->cancel();
-      return true;
-    } else if (auto *s = boost::get<udp::socket>(&*m_socket)) {
       s->cancel();
       return true;
     }
@@ -111,7 +86,7 @@ ProxyBase::ProxyBase(std::uint32_t session_id, tcp::socket &&client_socket,
 
 ProxyAuth::ProxyAuth(std::uint32_t session_id, tcp::socket &&client_socket)
     : ProxyBase(session_id, std::move(client_socket), 512),
-      m_resolver{m_clientSocket.get_executor()} {}
+      session_buffer_size{0} {}
 
 void ProxyAuth::start_internal() {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
@@ -232,31 +207,44 @@ void ProxyAuth::process_connection_request() {
   switch (m_inBuf[3]) {
   case 0x01: {
     auto ip4_bytes = ::ntohl(*reinterpret_cast<const uint32_t *>(m_inBuf(4)));
-    m_destinationAddress = ip::make_address_v4(ip4_bytes);
-    m_destinationPort =
-        ::ntohs(*reinterpret_cast<const uint16_t *>(m_inBuf(4 + address_size)));
+    auto host = ip::make_address_v4(ip4_bytes);
+    auto port =
+        ntohs(*reinterpret_cast<const uint16_t *>(m_inBuf(4 + address_size)));
+    tcp::endpoint direct_endpoint(std::move(host), port);
+    m_tcp_resolver_results =
+        tcp::resolver::results_type::create(std::move(direct_endpoint), "", "");
+    m_tcp_resolver_iter = m_tcp_resolver_results.cbegin();
     connect_to_destination(proxy_cmd);
     break;
   }
   case 0x03: {
     auto host = std::string_view(reinterpret_cast<const char *>(m_inBuf(5)),
                                  address_size);
-    auto port =
-        ::ntohs(*reinterpret_cast<const uint16_t *>(m_inBuf(5 + address_size)));
-    resolve_destination_host(proxy_cmd, host, port);
+    auto port = ntohs(
+        (*reinterpret_cast<const uint8_t *>(m_inBuf(5 + address_size)) << 0) |
+        (*reinterpret_cast<const uint8_t *>(m_inBuf(6 + address_size)) << 8));
+    tcp::endpoint direct_endpoint(ip::address_v4(), port);
+    m_tcp_resolver_results = tcp::resolver::results_type::create(
+        std::move(direct_endpoint), std::string(host), "");
+    m_tcp_resolver_iter = m_tcp_resolver_results.cbegin();
+    resolve_tcp_destination_host(proxy_cmd, host, port);
     break;
   }
   case 0x04: {
     auto ip6_array =
         *reinterpret_cast<const std::array<std::uint8_t, 16> *>(m_inBuf(4));
-    m_destinationAddress = ip::make_address_v6(ip6_array);
-    m_destinationPort =
-        ::ntohs(*reinterpret_cast<const uint16_t *>(m_inBuf(4 + address_size)));
+    auto host = ip::make_address_v6(ip6_array);
+    auto port =
+        ntohs(*reinterpret_cast<const uint16_t *>(m_inBuf(4 + address_size)));
+    tcp::endpoint direct_endpoint(std::move(host), port);
+    m_tcp_resolver_results =
+        tcp::resolver::results_type::create(std::move(direct_endpoint), "", "");
+    m_tcp_resolver_iter = m_tcp_resolver_results.cbegin();
     connect_to_destination(proxy_cmd);
     break;
   }
   default:
-    return;
+    break;
   }
 
   m_inBuf -= expected_size;
@@ -267,22 +255,30 @@ void ProxyAuth::send_server_response(std::uint8_t proxy_cmd,
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
 
   m_outBuf += {0x05, status_code, 0x00};
-  // TODO: Set DNS domain if available
-  if (m_destinationAddress.is_v4()) {
-    const uint32_t addr = ::htonl(m_destinationAddress.to_v4().to_uint());
+
+  auto tcp_endpoint = m_tcp_resolver_iter->endpoint();
+  auto tcp_address = tcp_endpoint.address();
+  if (m_tcp_resolver.has_value()) {
+    const auto tcp_hostname = m_tcp_resolver_iter->host_name();
+    m_outBuf += {0x03, static_cast<uint8_t>(tcp_hostname.length())};
+    m_outBuf += tcp_hostname;
+  } else if (tcp_address.is_v4()) {
+    const uint32_t addr = ::htonl(tcp_address.to_v4().to_uint());
     m_outBuf += {0x01, static_cast<uint8_t>(addr & 0x000000FF),
                  static_cast<uint8_t>((addr & 0x0000FF00) >> 8),
                  static_cast<uint8_t>((addr & 0x00FF0000) >> 16),
                  static_cast<uint8_t>((addr & 0xFF000000) >> 24)};
   } else {
     m_outBuf += {0x04};
-    const auto addr = m_destinationAddress.to_v6().to_bytes();
+    const auto addr = tcp_address.to_v6().to_bytes();
     for (const auto byte : addr)
       m_outBuf += {byte};
   }
-  const auto port = ::htons(m_destinationPort);
-  m_outBuf += {static_cast<uint8_t>(port & 0x00FF),
-               static_cast<uint8_t>((port & 0xFF00) >> 8)};
+  const auto port = htons(tcp_endpoint.port());
+  m_outBuf += std::initializer_list<unsigned char>{
+      static_cast<uint8_t>(port & 0x00FF),
+      static_cast<uint8_t>((port & 0xFF00) >> 8)};
+
   m_clientSocket.async_send(-m_outBuf,
                             boost::bind(&ProxyAuth::handle_response_write,
                                         shared_from_this(), proxy_cmd,
@@ -290,26 +286,25 @@ void ProxyAuth::send_server_response(std::uint8_t proxy_cmd,
                                         asio::placeholders::bytes_transferred));
 }
 
-void ProxyAuth::resolve_destination_host(std::uint8_t proxy_cmd,
-                                         const std::string_view &host,
-                                         std::uint16_t port) {
+void ProxyAuth::resolve_tcp_destination_host(std::uint8_t proxy_cmd,
+                                             const std::string_view &host,
+                                             std::uint16_t port) {
   BOOST_ASIO_HANDLER_LOCATION((__FILE__, __LINE__, __func__));
 
-  m_resolver.async_resolve(host, std::to_string(port),
-                           [this, self = shared_from_this(),
-                            proxy_cmd](const system::error_code &ec,
-                                       const tcp::resolver::iterator &it) {
-                             if (ec) {
-                               send_server_response(proxy_cmd, 0x04);
-                               return;
-                             }
-                             /* TODO: Support iterating and connecting to
-                              * multiple resolved hosts on failure. */
-                             auto endpoint = it->endpoint();
-                             m_destinationAddress = endpoint.address();
-                             m_destinationPort = endpoint.port();
-                             connect_to_destination(proxy_cmd);
-                           });
+  m_tcp_resolver.emplace(m_clientSocket.get_executor());
+  m_tcp_resolver->async_resolve(
+      host, std::to_string(port),
+      [this, self = shared_from_this(),
+       proxy_cmd](const system::error_code &ec,
+                  boost::asio::ip::tcp::resolver::results_type res) {
+        if (ec) {
+          send_server_response(proxy_cmd, 0x04);
+          return;
+        }
+        m_tcp_resolver_results = std::move(res);
+        m_tcp_resolver_iter = m_tcp_resolver_results.cbegin();
+        connect_to_destination(proxy_cmd);
+      });
 }
 
 void ProxyAuth::connect_to_destination(std::uint8_t proxy_cmd) {
@@ -317,6 +312,12 @@ void ProxyAuth::connect_to_destination(std::uint8_t proxy_cmd) {
 
   const auto check_error = [this, proxy_cmd](const system::error_code &ec) {
     if (ec) {
+      auto tmp_iter = m_tcp_resolver_iter;
+      if (++tmp_iter != m_tcp_resolver_results.cend()) {
+        m_tcp_resolver_iter = tmp_iter;
+        return connect_to_destination(proxy_cmd);
+      }
+
       if (ec == system::errc::connection_refused)
         send_server_response(proxy_cmd, 0x05);
       else if (ec == system::errc::network_unreachable)
@@ -330,44 +331,33 @@ void ProxyAuth::connect_to_destination(std::uint8_t proxy_cmd) {
     send_server_response(proxy_cmd, 0x00);
   };
 
-  auto ds_result = m_getDestinationSocket(m_clientSocket.get_executor());
-  if (!ds_result) {
-    send_server_response(proxy_cmd, 0x01);
-    return;
+  if (!m_destinationSocket) {
+    m_destinationSocket = m_getDestinationSocket(m_clientSocket.get_executor());
+    if (!m_destinationSocket)
+      return send_server_response(proxy_cmd, 0x01);
   }
-  m_destinationSocket = std::move(ds_result);
 
   switch (proxy_cmd) {
   case 0x01: // TCP client connection
   {
+
     m_destinationSocket->connect_tcp(
-        m_destinationAddress, m_destinationPort,
+        m_tcp_resolver_iter,
         [self = shared_from_this(), check_error](const system::error_code &ec) {
           check_error(ec);
         });
     return;
   }
-  case 0x02: // TCP port bind
+  case 0x02: // TCP port bind (not implemented)
   {
-    m_destinationSocket->tcp_bind(
-        m_destinationAddress, m_destinationPort,
-        [self = shared_from_this(), check_error](const system::error_code &ec) {
-          check_error(ec);
-        });
-    return;
+    return send_server_response(proxy_cmd, 0x07);
   }
-  case 0x03: // UDP port bind
+  case 0x03: // UDP port bind (not implemented)
   {
-    m_destinationSocket->udp_bind(
-        m_destinationAddress, m_destinationPort,
-        [self = shared_from_this(), check_error](const system::error_code &ec) {
-          check_error(ec);
-        });
-    return;
+    return send_server_response(proxy_cmd, 0x07);
   }
   default:
-    send_server_response(proxy_cmd, 0x01);
-    return;
+    return send_server_response(proxy_cmd, 0x07);
   }
 }
 
@@ -405,9 +395,16 @@ void ProxyAuth::handle_response_write(std::uint8_t proxy_cmd,
   }
 
   if (status_code == 0x00) {
-    auto session = std::make_shared<ProxySession>(
-        m_sessionId, std::move(m_clientSocket), std::move(m_destinationSocket),
-        std::move(m_inBuf), std::move(m_outBuf));
+    std::shared_ptr<ProxySession> session = nullptr;
+    if (session_buffer_size)
+      session = std::make_shared<ProxySession>(
+          m_sessionId, std::move(m_clientSocket),
+          std::move(m_destinationSocket), session_buffer_size);
+    else
+      session = std::make_shared<ProxySession>(
+          m_sessionId, std::move(m_clientSocket),
+          std::move(m_destinationSocket), std::move(m_inBuf),
+          std::move(m_outBuf));
     if (!session) {
       m_clientSocket.cancel();
       return;
@@ -534,6 +531,7 @@ void ProxyServer::async_accept() {
               std::move(client_socket));
 
           if (auth_session) {
+            auth_session->set_session_buffer_size(BUFSIZ);
             auth_session->start([](any_io_executor exec) {
               auto aptr = new AsyncDestinationSocket<any_io_executor>(exec);
               return std::shared_ptr<DestinationSocketBase>(std::move(aptr));
@@ -546,29 +544,16 @@ void ProxyServer::async_accept() {
 
 template <typename Executor>
 void LoggingAsyncDestinationSocket<Executor>::do_connect_tcp(
-    ip::address &address, uint16_t port,
+    boost::asio::ip::tcp::resolver::results_type::const_iterator &it,
     std::function<void(system::error_code)> handler) {
-  std::cout << "LoggingProxyServer::do_connect_tcp(): " << address.to_string()
-            << ":" << port << "\n";
-  AsyncDestinationSocket<Executor>::do_connect_tcp(address, port, handler);
-}
-
-template <typename Executor>
-void LoggingAsyncDestinationSocket<Executor>::do_bind_tcp(
-    ip::address &address, uint16_t port,
-    std::function<void(system::error_code)> handler) {
-  std::cout << "LoggingProxyServer::do_bind_tcp(): " << address.to_string()
-            << ":" << port << "\n";
-  AsyncDestinationSocket<Executor>::do_bind_tcp(address, port, handler);
-}
-
-template <typename Executor>
-void LoggingAsyncDestinationSocket<Executor>::do_bind_udp(
-    ip::address &address, uint16_t port,
-    std::function<void(system::error_code)> handler) {
-  std::cout << "LoggingProxyServer::do_bind_udp(): " << address.to_string()
-            << ":" << port << "\n";
-  AsyncDestinationSocket<Executor>::do_bind_udp(address, port, handler);
+  const auto endpoint = it->endpoint();
+  {
+    std::lock_guard log_mtx{g_loggingMutex};
+    std::cout << "LoggingProxyServer::do_connect_tcp(): "
+              << endpoint.address().to_string() << ":" << endpoint.port()
+              << "\n";
+  }
+  AsyncDestinationSocket<Executor>::do_connect_tcp(it, handler);
 }
 
 template <typename Executor>
@@ -601,13 +586,19 @@ LoggingProxyServer::LoggingProxyServer(io_context &ioc,
       m_bytesRead{0}, m_bytesWritten{0} {}
 
 void LoggingProxyServer::start() {
-  std::cout << "LoggingProxyServer::start()\n";
+  {
+    std::lock_guard log_mtx{g_loggingMutex};
+    std::cout << "LoggingProxyServer::start()\n";
+  }
   ProxyServer::start();
   async_timer();
 }
 
 void LoggingProxyServer::stop() {
-  std::cout << "LoggingProxyServer::stop()\n";
+  {
+    std::lock_guard log_mtx{g_loggingMutex};
+    std::cout << "LoggingProxyServer::stop()\n";
+  }
   ProxyServer::stop();
   m_statusLogger.cancel();
 }
@@ -616,7 +607,10 @@ void LoggingProxyServer::async_timer() {
   m_statusLogger.expires_from_now(boost::posix_time::seconds(1));
   m_statusLogger.async_wait([this](const system::error_code &ec) {
     if (ec) {
-      std::cout << "LoggingProxyServer::async_timer() ERROR: " << ec << "\n";
+      {
+        std::lock_guard log_mtx{g_loggingMutex};
+        std::cout << "LoggingProxyServer::async_timer() ERROR: " << ec << "\n";
+      }
       return;
     }
 
@@ -637,11 +631,14 @@ void LoggingProxyServer::async_timer() {
                          return w.expired();
                        }),
         m_weakDestinationSockets.end());
-    std::cout << "LoggingProxyServer::async_timer(): served "
-              << m_nextSessionId.load(std::memory_order_relaxed) - 1
-              << " sessions, " << total_ds << " active sessions, "
-              << m_bytesRead << " bytes read, " << m_bytesWritten
-              << " bytes written\n";
+    {
+      std::lock_guard log_mtx{g_loggingMutex};
+      std::cout << "LoggingProxyServer::async_timer(): served "
+                << m_nextSessionId.load(std::memory_order_relaxed) - 1
+                << " sessions, " << total_ds << " active sessions, "
+                << m_bytesRead << " bytes read, " << m_bytesWritten
+                << " bytes written\n";
+    }
     async_timer();
   });
 }
@@ -652,16 +649,20 @@ void LoggingProxyServer::async_accept() {
       [this](const system::error_code &ec, tcp::socket client_socket) {
         if (!ec) {
           auto const client_endpoint = client_socket.remote_endpoint();
-          std::cout << "LoggingProxyServer::async_accept() ACCEPT: id "
-                    << m_nextSessionId.load(std::memory_order_relaxed)
-                    << " from " << client_endpoint.address().to_string() << ":"
-                    << client_endpoint.port() << "\n";
+          {
+            std::lock_guard log_mtx{g_loggingMutex};
+            std::cout << "LoggingProxyServer::async_accept() ACCEPT: id "
+                      << m_nextSessionId.load(std::memory_order_relaxed)
+                      << " from " << client_endpoint.address().to_string()
+                      << ":" << client_endpoint.port() << "\n";
+          }
 
           auto auth_session = std::make_shared<ProxyAuth>(
               m_nextSessionId.fetch_add(1, std::memory_order_relaxed),
               std::move(client_socket));
 
           if (auth_session) {
+            auth_session->set_session_buffer_size(BUFSIZ);
             auth_session->start([this](any_io_executor exec) {
               auto shared_ptr = std::make_shared<
                   LoggingAsyncDestinationSocket<any_io_executor>>(exec);
@@ -672,8 +673,11 @@ void LoggingProxyServer::async_accept() {
             });
           }
         } else {
-          std::cout << "LoggingProxyServer::async_accept() ERROR: " << ec
-                    << "\n";
+          {
+            std::lock_guard log_mtx{g_loggingMutex};
+            std::cout << "LoggingProxyServer::async_accept() ERROR: " << ec
+                      << "\n";
+          }
           return;
         }
         async_accept();
@@ -715,6 +719,7 @@ void CustomProtocolProxyServer::async_accept() {
               std::move(client_socket));
 
           if (auth_session) {
+            auth_session->set_session_buffer_size(BUFSIZ);
             auth_session->start([](any_io_executor exec) {
               auto aptr =
                   new CustomProtocolAsyncDestinationSocket<any_io_executor>(

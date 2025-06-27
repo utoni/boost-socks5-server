@@ -14,7 +14,7 @@
 #include <memory>
 #include <string_view>
 
-#include "fastbuffer.hpp"
+#include "boost-asio-fastbuffer/fastbuffer.hpp"
 
 namespace SOCKS5 {
 class DestinationSocketBase : private boost::noncopyable {
@@ -22,20 +22,13 @@ public:
   virtual ~DestinationSocketBase() {}
 
   template <typename Callback>
-  void connect_tcp(boost::asio::ip::address &address, uint16_t port,
-                   Callback &&handler) {
-    do_connect_tcp(address, port, std::forward<Callback>(handler));
+  void
+  connect_tcp(boost::asio::ip::tcp::resolver::results_type::const_iterator &it,
+              Callback &&handler) {
+    do_connect_tcp(it, std::forward<Callback>(handler));
   }
-  template <typename Callback>
-  void tcp_bind(boost::asio::ip::address &address, uint16_t port,
-                Callback &&handler) {
-    do_bind_tcp(address, port, std::forward<Callback>(handler));
-  }
-  template <typename Callback>
-  void udp_bind(boost::asio::ip::address &address, uint16_t port,
-                Callback &&handler) {
-    do_bind_udp(address, port, std::forward<Callback>(handler));
-  }
+  void tcp_bind() { throw std::runtime_error("TCP Bind not implemented"); }
+  void udp_bind() { throw std::runtime_error("UDP Bind not implemented"); }
   template <typename Callback>
   bool read(BufferBase &buffer, Callback &&handler) {
     return do_read(buffer, std::forward<Callback>(handler));
@@ -47,13 +40,9 @@ public:
   virtual bool cancel() = 0;
 
 protected:
-  virtual void
-  do_connect_tcp(boost::asio::ip::address &address, uint16_t port,
-                 std::function<void(boost::system::error_code)>) = 0;
-  virtual void do_bind_tcp(boost::asio::ip::address &address, uint16_t port,
-                           std::function<void(boost::system::error_code)>) = 0;
-  virtual void do_bind_udp(boost::asio::ip::address &address, uint16_t port,
-                           std::function<void(boost::system::error_code)>) = 0;
+  virtual void do_connect_tcp(
+      boost::asio::ip::tcp::resolver::results_type::const_iterator &it,
+      std::function<void(boost::system::error_code)>) = 0;
   virtual bool
   do_read(BufferBase &,
           std::function<void(boost::system::error_code, std::size_t)>) = 0;
@@ -70,12 +59,8 @@ public:
 
 protected:
   void do_connect_tcp(
-      boost::asio::ip::address &address, uint16_t port,
+      boost::asio::ip::tcp::resolver::results_type::const_iterator &it,
       std::function<void(boost::system::error_code)> handler) override;
-  void do_bind_tcp(boost::asio::ip::address &address, uint16_t port,
-                   std::function<void(boost::system::error_code)>) override;
-  void do_bind_udp(boost::asio::ip::address &address, uint16_t port,
-                   std::function<void(boost::system::error_code)>) override;
   bool do_read(BufferBase &buffer,
                std::function<void(boost::system::error_code, std::size_t)>
                    handler) override;
@@ -85,11 +70,8 @@ protected:
   bool cancel() override;
 
   boost::asio::strand<Executor> m_strand;
-  boost::optional<boost::variant<
-      boost::asio::ip::tcp::socket,   // TCP connect
-      boost::asio::ip::tcp::acceptor, // TCP bind (not implemented)
-      boost::asio::ip::udp::socket    // UDP bind (not implemented)
-      >>
+  boost::optional<boost::variant<boost::asio::ip::tcp::socket // TCP connect
+                                 >>
       m_socket;
 };
 
@@ -119,33 +101,37 @@ public:
     m_getDestinationSocket = std::forward<GetDsCallback>(handler);
     start_internal();
   }
+  void set_session_buffer_size(std::size_t buffer_size) {
+    session_buffer_size = buffer_size;
+  }
 
 private:
   void start_internal();
   void recv_client_greeting(const boost::system::error_code &ec,
                             std::size_t length);
-  void recv_client_greeting(std::size_t length);
   void send_server_greeting(bool auth_supported);
   void recv_connection_request(const boost::system::error_code &ec,
                                std::size_t length);
   void process_connection_request();
   void send_server_response(std::uint8_t proxy_cmd, std::uint8_t status_code);
-  void resolve_destination_host(std::uint8_t proxy_cmd,
-                                const std::string_view &host,
-                                std::uint16_t port);
+  void resolve_tcp_destination_host(std::uint8_t proxy_cmd,
+                                    const std::string_view &host,
+                                    std::uint16_t port);
   void connect_to_destination(std::uint8_t proxy_cmd);
   void handle_write(const boost::system::error_code &ec, std::size_t length);
   void handle_response_write(std::uint8_t proxy_cmd, std::uint8_t status_code,
                              const boost::system::error_code &ec,
                              std::size_t length);
 
+  std::size_t session_buffer_size;
   std::function<std::shared_ptr<DestinationSocketBase>(
       boost::asio::any_io_executor)>
       m_getDestinationSocket;
   std::shared_ptr<DestinationSocketBase> m_destinationSocket;
-  boost::asio::ip::tcp::resolver m_resolver;
-  boost::asio::ip::address m_destinationAddress;
-  std::uint16_t m_destinationPort;
+  boost::optional<boost::asio::ip::tcp::resolver> m_tcp_resolver;
+  boost::asio::ip::tcp::resolver::results_type m_tcp_resolver_results;
+  boost::asio::ip::tcp::resolver::results_type::const_iterator
+      m_tcp_resolver_iter;
 };
 
 class ProxySession : private ProxyBase,
@@ -154,7 +140,7 @@ public:
   ProxySession(std::uint32_t session_id,
                boost::asio::ip::tcp::socket &&client_socket,
                std::shared_ptr<DestinationSocketBase> &&dest_socket,
-               std::size_t buffer_size = BUFSIZ);
+               std::size_t buffer_size);
   ProxySession(std::uint32_t session_id,
                boost::asio::ip::tcp::socket &&client_socket,
                std::shared_ptr<DestinationSocketBase> &&dest_socket,
@@ -210,12 +196,8 @@ public:
 
 private:
   void do_connect_tcp(
-      boost::asio::ip::address &address, uint16_t port,
+      boost::asio::ip::tcp::resolver::results_type::const_iterator &it,
       std::function<void(boost::system::error_code)> handler) override;
-  void do_bind_tcp(boost::asio::ip::address &address, uint16_t port,
-                   std::function<void(boost::system::error_code)>) override;
-  void do_bind_udp(boost::asio::ip::address &address, uint16_t port,
-                   std::function<void(boost::system::error_code)>) override;
   bool do_read(BufferBase &buffer,
                std::function<void(boost::system::error_code, std::size_t)>
                    handler) override;

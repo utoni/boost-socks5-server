@@ -1,6 +1,6 @@
 CXX = g++
 GIT = git
-CXXFLAGS = -Wall -Wextra -Iboost-asio-fastbuffer
+CXXFLAGS = -Wall -Wextra
 SERVER_HDRS = socks5.hpp
 SERVER_SRCS = socks5.cpp main.cpp
 
@@ -13,6 +13,8 @@ endif
 endif
 ifneq ($(DEBUG),)
 CXXFLAGS += -g3 #-DBOOST_ASIO_ENABLE_HANDLER_TRACKING=1
+else
+CXXFLAGS += -O3 -fomit-frame-pointer -flto
 endif
 ifneq ($(HANDLER_TRACKING),)
 CXXFLAGS += -DBOOST_ASIO_ENABLE_HANDLER_TRACKING=1
